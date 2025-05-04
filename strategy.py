@@ -130,13 +130,6 @@ class BitgetTradingStrategy:
                 market_data = ticker_data['data'][0]
                 current_price = float(market_data['lastPr'])
                 
-                # Log additional market information
-                logger.info(f"Current market data for {symbol}:")
-                logger.info(f"Last Price: ${current_price}")
-                logger.info(f"Bid: ${market_data['bidPr']} | Ask: ${market_data['askPr']}")
-                logger.info(f"24h Change: {float(market_data['change24h'])*100:.2f}%")
-                logger.info(f"24h Volume: {market_data['baseVolume']} {symbol.replace('USDT', '')}")
-                                
                 # Update trailing stop if needed
                 updated_stop = self.check_trailing_stop(
                     symbol, 
