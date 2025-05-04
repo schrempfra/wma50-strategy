@@ -1,0 +1,883 @@
+import time
+import json
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import config
+from signature import SignatureHandler
+import logging
+from datetime import datetime, timedelta
+import sys
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("WMAStrategy")
+
+class BitgetTradingStrategy:
+    def __init__(self, api_key, api_secret, passphrase, symbol='BTCUSDT', quantity=0.0001, check_interval=2):
+        """
+        Initialize the Bitget trading strategy with API credentials and trading parameters
+        """
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.passphrase = passphrase
+        self.symbol = symbol
+        self.base_url = "https://api.bitget.com"
+        
+        # WMA-based Strategy parameters
+        self.ma_period = 50                    # WMA-50
+        self.take_profit_percent = 5.0         # Take profit at 5%
+        self.stop_loss_percent = 1          # Stop loss at 1%
+        self.exit_hours = 36                   # Exit after 36 hours
+        self.use_trailing_stop = True          # Use trailing stop
+        self.trailing_activation_percent = 1.5  # Activate trailing stop at 1.5% profit
+        self.trailing_distance_percent = 1.0    # 1% trailing distance
+        self.position_size_percent = 30.0      # Use 30% of available capital
+        self.leverage = 1                      # Use 1x leverage
+        self.check_interval = check_interval
+        self.quantity = quantity
+        
+        # Performance tracking
+        self.active_positions = []
+        self.trailing_stops = {}
+
+        # Initialize signature handler
+        self.signature_handler = SignatureHandler(api_secret, passphrase)
+    
+    def check_trailing_stop(self, symbol, entry_price, current_price, order_id, direction):
+        """
+        Check and update trailing stop if needed (works for both long and short positions)
+        """
+        if direction == 'long':
+            # Long: Profit when current_price > entry_price
+            profit_pct = ((current_price - entry_price) / entry_price) * 100
+            # Trailing stop moves up with price
+            trailing_stop_price = current_price * (1 - self.trailing_distance_percent/100)
+            original_stop = entry_price * (1 - self.stop_loss_percent/100)
+            activation_condition = profit_pct >= self.trailing_activation_percent
+            update_condition = current_price > self.trailing_stops.get(order_id, {}).get('activation_price', -float('inf'))
+            raise_condition = trailing_stop_price > self.trailing_stops.get(order_id, {}).get('stop_price', -float('inf'))
+            # For long: Stop must never go below original_stop
+        else:
+            # Short: Profit when current_price < entry_price
+            profit_pct = ((entry_price - current_price) / entry_price) * 100
+            # Trailing stop moves down with price
+            trailing_stop_price = current_price * (1 + self.trailing_distance_percent/100)
+            original_stop = entry_price * (1 + self.stop_loss_percent/100)
+            activation_condition = profit_pct >= self.trailing_activation_percent
+            update_condition = current_price < self.trailing_stops.get(order_id, {}).get('activation_price', float('inf'))
+            raise_condition = trailing_stop_price < self.trailing_stops.get(order_id, {}).get('stop_price', float('inf'))
+            # For short: Stop must never go above original_stop
+
+        # Activate trailing stop
+        if order_id not in self.trailing_stops:
+            if activation_condition:
+                # Only activate if new stop is "better" than original
+                if (direction == 'long' and trailing_stop_price > original_stop) or (direction == 'short' and trailing_stop_price < original_stop):
+                    self.trailing_stops[order_id] = {
+                        'stop_price': trailing_stop_price,
+                        'activation_price': current_price
+                    }
+                    logger.info(f"Activated trailing stop for {symbol} at {trailing_stop_price:.2f} ({direction})")
+                    return trailing_stop_price
+        # Update trailing stop
+        elif order_id in self.trailing_stops:
+            if update_condition:
+                if raise_condition:
+                    self.trailing_stops[order_id]['stop_price'] = trailing_stop_price
+                    self.trailing_stops[order_id]['activation_price'] = current_price
+                    logger.info(f"Updated trailing stop for {symbol} to {trailing_stop_price:.2f} ({direction})")
+                    return trailing_stop_price
+            # Return current stop price
+            return self.trailing_stops[order_id]['stop_price']
+
+        # Return original stop loss if not activated
+        return original_stop
+
+    def monitor_positions(self):
+        """
+        Monitor and manage open positions
+        """
+        if not self.active_positions:
+            return
+            
+        # Make a copy to avoid modifying during iteration
+        positions_to_check = self.active_positions.copy()
+        
+        for position in positions_to_check:
+            try:
+                # Get current price
+                symbol = position['symbol']
+                
+                # For live trading, get latest ticker price using v2 API
+                params = {
+                    'symbol': symbol,
+                    'productType': 'USDT-FUTURES'
+                }
+                ticker_data = self._make_request('GET', "/api/v2/mix/market/ticker", params=params)
+                
+                if not ticker_data or ticker_data.get('code') != '00000' or not ticker_data.get('data'):
+                    logger.warning(f"Failed to get ticker data for {symbol}")
+                    continue
+                
+                # Extract price from the first item in the data array
+                market_data = ticker_data['data'][0]
+                current_price = float(market_data['lastPr'])
+                
+                # Log additional market information
+                logger.info(f"Current market data for {symbol}:")
+                logger.info(f"Last Price: ${current_price}")
+                logger.info(f"Bid: ${market_data['bidPr']} | Ask: ${market_data['askPr']}")
+                logger.info(f"24h Change: {float(market_data['change24h'])*100:.2f}%")
+                logger.info(f"24h Volume: {market_data['baseVolume']} {symbol.replace('USDT', '')}")
+                
+                self.close_position(position, current_price, "Take Profit")
+                sys.exit()
+                # Update trailing stop if needed
+                updated_stop = self.check_trailing_stop(
+                    symbol, 
+                    position['entry_price'], 
+                    current_price, 
+                    position['order_id'],
+                    position['direction']
+                )
+                
+                # Check exit conditions based on position direction
+                if position['direction'] == 'long':
+                    # Long position exit conditions
+                    # 1. Take profit hit
+                    if current_price >= position['take_profit']:
+                        self.close_position(position, current_price, "Take Profit")
+                        continue
+                        
+                    # 2. Stop loss hit (possibly trailing stop)
+                    if current_price <= updated_stop:
+                        self.close_position(position, current_price, "Stop Loss")
+                        continue
+                else:
+                    # Short position exit conditions
+                    # 1. Take profit hit
+                    if current_price <= position['take_profit']:
+                        self.close_position(position, current_price, "Take Profit")
+                        continue
+                        
+                    # 2. Stop loss hit (possibly trailing stop)
+                    if current_price >= updated_stop:
+                        self.close_position(position, current_price, "Stop Loss")
+                        continue
+                    
+                # 3. Time-based exit (applies to both long and short)
+                if datetime.now() >= position['exit_time']:
+                    self.close_position(position, current_price, "Time Exit")
+                    continue
+            except Exception as e:
+                logger.error(f"Error monitoring position {position['order_id']}: {str(e)}")
+
+    def get_account_balance(self):
+        """
+        Get the available balance from the exchange
+        """
+        try:
+            # Get account balance from API
+            endpoint = "/api/v2/mix/account/accounts"
+            params = {
+                'productType': 'USDT-FUTURES'
+            }
+            
+            response = self._make_request('GET', endpoint, params=params)
+            if not response or response.get('code') != '00000':
+                logger.error(f"Failed to get account balance: {response}")
+                return 0
+                
+            # Extract available balance
+            for account in response.get('data', []):
+                if account.get('marginCoin') == 'USDT':
+                    available_balance = float(account.get('available', 0))
+                    logger.info(f"Available balance: {available_balance} USDT")
+                    return available_balance
+                    
+            logger.warning("No USDT account found")
+            return 0
+        except Exception as e:
+            logger.error(f"Error getting account balance: {str(e)}")
+            return 0
+
+    def close_position(self, position, exit_price, exit_reason):
+        """
+        Close a position and record the trade
+        Works for both long and short positions
+        """
+        try:
+            direction = position.get('direction', 'long')  # Default to long if not specified
+            logger.info(f"Attempting to close {direction} position for {position['symbol']} at {exit_price:.2f} ({exit_reason})")
+            
+            # First check if we still have a position
+            position_response = self._make_request('GET', "/api/v2/mix/position/single-position", params={
+                "symbol": self.symbol,
+                "productType": "USDT-FUTURES",
+                "marginCoin": "USDT"
+            })
+            
+            # Check if we have any position data before proceeding
+            if (not position_response or 
+                position_response.get('code') != '00000' or 
+                not position_response.get('data') or
+                float(position_response.get('data', [{}])[0].get('total', '0')) <= 0):
+                logger.warning(f"No position found to close for {self.symbol}")
+                # Still remove from active positions to avoid repeated closing attempts
+                self.active_positions = [p for p in self.active_positions if p['order_id'] != position['order_id']]
+                if position['order_id'] in self.trailing_stops:
+                    del self.trailing_stops[position['order_id']]
+                return
+            
+            # Set appropriate limit price to ensure execution
+            adjustment_factor = 1.00005 if direction == 'long' else 0.99995
+            limit_price = exit_price * adjustment_factor
+            
+            # Cancel pending orders
+            self._make_request('POST', "/api/v2/mix/order/cancel-all-orders", data={
+                "symbol": self.symbol,
+                "productType": "USDT-FUTURES",
+                "marginCoin": "USDT"
+            })
+
+            # Try limit order first
+            order_success = False
+            order_result = self.place_limit_order(
+                size=position['position_size'],
+                side="sell" if direction == 'long' else "buy",
+                trade_side="close",
+                price=limit_price
+            )
+            
+            if order_result:
+                order_success = True
+                logger.info(f"Closed {direction} position with limit order")
+            else:
+                logger.error(f"Failed to close {direction} position with limit order")
+                
+                # Fallback to market order if limit order failed
+                market_result = self.place_market_order(
+                    size=position['position_size'],
+                    side="sell" if direction == 'long' else "buy",
+                    trade_side="close"
+                )
+                
+                if market_result:
+                    order_success = True
+                    logger.info(f"Closed {direction} position with market order")
+                else:
+                    logger.error(f"Failed to close {direction} position with market order")
+
+            # Remove position from active positions
+            self.active_positions = [p for p in self.active_positions if p['order_id'] != position['order_id']]
+            
+            # Remove trailing stop data if exists
+            if position['order_id'] in self.trailing_stops:
+                del self.trailing_stops[position['order_id']]
+                
+            if order_success:
+                logger.info(f"Successfully closed {direction} position for {position['symbol']}")
+            else:
+                logger.warning(f"Could not close {direction} position for {position['symbol']} - manual intervention may be needed")
+                
+        except Exception as e:
+            logger.error(f"Error closing position: {str(e)}")
+
+    def emergency_close_all(self):
+        """
+        Emergency function to close all open positions
+        Uses a multi-layered approach to reliably close all positions
+        """
+        logger.warning("EMERGENCY: Closing all positions")
+        
+        try:
+            # Cancel pending orders
+            self._make_request('POST', "/api/v2/mix/order/cancel-all-orders", data={
+                "symbol": self.symbol,
+                "productType": "USDT-FUTURES",
+                "marginCoin": "USDT"
+            })
+
+            # Get current positions
+            position_response = self._make_request('GET', "/api/v2/mix/position/single-position", params={
+                "symbol": self.symbol,
+                "productType": "USDT-FUTURES",
+                "marginCoin": "USDT"
+            })
+            
+            if not position_response or position_response.get('code') != '00000':
+                logger.error(f"Failed to get positions: {position_response}")
+                return
+            
+            if position_response.get('data'):
+                position_data = position_response.get('data', [])[0]
+                holdSide = position_data.get('holdSide', '')
+                total_size = position_data.get('available', '0')
+                
+                if holdSide and float(total_size) > 0:
+                    # Try close-positions endpoint first
+                    close_response = self._make_request('POST', "/api/v2/mix/order/close-positions", data={
+                        "symbol": self.symbol,
+                        "productType": "USDT-FUTURES",
+                        "marginCoin": "USDT",
+                        "holdSide": holdSide
+                    })
+                    
+                    if close_response and close_response.get('code') == '00000':
+                        return
+                    
+                    # Fallback to market order
+                    market_response = self._make_request('POST', "/api/v2/mix/order/place-order", data={
+                        "symbol": self.symbol,
+                        "productType": "USDT-FUTURES",
+                        "marginCoin": "USDT",
+                        "size": total_size,
+                        "side": "sell" if holdSide == "long" else "buy",
+                        "tradeSide": "close",
+                        "orderType": "market",
+                        "marginMode": "isolated",
+                        "force": "gtc",
+                        "clientOid": f"emergency_{int(time.time())}"
+                    })
+                    
+                    # Final fallback to limit order
+                    if not market_response or market_response.get('code') != '00000':
+                        ticker_data = self._make_request('GET', "/api/v2/mix/market/ticker", params={
+                            "symbol": self.symbol,
+                            "productType": "USDT-FUTURES"
+                        })
+                        
+                        if ticker_data and ticker_data.get('code') == '00000' and ticker_data.get('data'):
+                            current_price = float(ticker_data['data'][0]['lastPr'])
+                            execution_price = current_price * 0.99 if holdSide == "long" else current_price * 1.01
+                            
+                            self._make_request('POST', "/api/v2/mix/order/place-order", data={
+                                "symbol": self.symbol,
+                                "productType": "USDT-FUTURES",
+                                "marginCoin": "USDT",
+                                "size": total_size,
+                                "side": "sell" if holdSide == "long" else "buy",
+                                "tradeSide": "close",
+                                "orderType": "limit",
+                                "price": str(execution_price),
+                                "marginMode": "isolated",
+                                "force": "gtc",
+                                "clientOid": f"emergency_limit_{int(time.time())}"
+                            })
+
+            # Remove position from active positions
+            self.active_positions = []
+            # Remove trailing stop data if exists
+            self.trailing_stops = {}
+        except Exception as e:
+            logger.error(f"Error in emergency close: {str(e)}")
+            raise
+
+    def _make_request(self, method, endpoint, params=None, data=None):
+        """
+        Make an authenticated request to the Bitget API
+        """
+        url = f"{self.base_url}{endpoint}"
+        timestamp = str(self.signature_handler.get_timestamp())
+        
+        # Handle query parameters for GET requests
+        if method == 'GET' and params:
+            query_string = self.signature_handler.parse_params_to_str(params)
+            endpoint = f"{endpoint}{query_string}"
+            url = f"{self.base_url}{endpoint}"
+        
+        # Create request body for POST requests
+        body = ''
+        if method == 'POST' and data:
+            body = json.dumps(data)
+        
+        # Generate signature
+        message = self.signature_handler.pre_hash(timestamp, method, endpoint, body)
+        signature = self.signature_handler.sign(message)
+        
+        # Set headers
+        headers = {
+            'ACCESS-KEY': self.api_key,
+            'ACCESS-SIGN': signature,
+            'ACCESS-TIMESTAMP': timestamp,
+            'ACCESS-PASSPHRASE': self.passphrase,
+            'Content-Type': 'application/json'
+        }
+        
+        # Make the request
+        if method == 'GET':
+            response = requests.get(url, headers=headers)
+        elif method == 'POST':
+            response = requests.post(url, headers=headers, data=body)
+        
+        # Check for errors
+        if response.status_code != 200:
+            print(f"API Error: {response.status_code} - {response.text}")
+            return None
+        
+        return response.json()
+    
+    def get_klines(self, interval='4H', limit=200):
+        """
+        Get historical candlestick data from Bitget
+        
+        Valid intervals: 1m, 3m, 5m, 15m, 30m, 1H, 4H, 6H, 12H, 1D, 1W, 1M, 
+                        6Hutc, 12Hutc, 1Dutc, 3Dutc, 1Wutc, 1Mutc
+        """
+        endpoint = "/api/v2/mix/market/candles"
+        params = {
+            'symbol': self.symbol,
+            'productType': 'USDT-FUTURES',
+            'granularity': interval,
+            'limit': limit
+        }
+        
+        response = self._make_request('GET', endpoint, params=params)
+        if not response or response.get('code') != '00000':
+            print(f"Failed to get klines: {response}")
+            return None
+        
+        # Process the candlestick data
+        candles = response.get('data', [])
+        df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'usdtVolume'])
+        
+        # Convert string values to numeric
+        for col in ['open', 'high', 'low', 'close', 'volume', 'usdtVolume']:
+            df[col] = pd.to_numeric(df[col])
+        
+        # Convert timestamp to datetime - fix the deprecation warning
+        # Explicitly convert to numeric type first
+        df['timestamp'] = pd.to_numeric(df['timestamp'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        
+        # Sort by timestamp in ascending order
+        df = df.sort_values(by='timestamp')
+        
+        return df
+    
+    def calculate_indicators(self, df):
+        """
+        Calculate Weighted Moving Average indicator
+        """
+        # Calculate Weighted Moving Average with period 50
+        weights = np.arange(1, self.ma_period + 1)
+        df['wma'] = df['close'].rolling(window=self.ma_period).apply(
+            lambda x: np.sum(weights * x) / weights.sum(), raw=True
+        )
+        
+        # Add WMA direction (1 for up, -1 for down)
+        df['wma_direction'] = np.where(df['wma'].diff() > 0, 1, -1)
+        
+        # Add price relative to WMA (in percent)
+        df['price_to_wma'] = (df['close'] - df['wma']) / df['wma'] * 100
+        
+        return df
+    
+    def find_trade_setup(self):
+        """
+        Find potential trade setups based on the WMA crossover strategy with optimized parameters
+        """
+        try:
+            df = self.get_klines(limit=200)
+                
+            if df is None or len(df) < self.ma_period:
+                logger.warning("Not enough data to calculate indicators")
+                return None
+            
+            # Calculate indicators
+            df = self.calculate_indicators(df)
+            
+            # Get the latest values
+            latest = df.iloc[-1]
+            previous = df.iloc[-2]
+            
+            logger.debug(f"Latest candle - Close: {latest['close']:.2f}, WMA: {latest['wma']:.2f}, WMA Direction: {latest['wma_direction']}")
+            logger.debug(f"Previous candle - Close: {previous['close']:.2f}, WMA: {previous['wma']:.2f}")
+              
+            # Check for long signal:
+            # 1. Price crosses above WMA (previous close below WMA, current close above WMA)
+            # 2. WMA is trending up
+            prev_below_wma = previous['close'] < previous['wma']
+            curr_above_wma = latest['close'] > latest['wma']
+            wma_trending_up = latest['wma_direction'] > 0
+            
+            logger.debug(f"Long signal conditions - Prev below WMA: {prev_below_wma}, Curr above WMA: {curr_above_wma}, WMA trending up: {wma_trending_up}")
+            
+            # Check for short signal:
+            # 1. Price crosses below WMA (previous close above WMA, current close below WMA)
+            # 2. WMA is trending down
+            prev_above_wma = previous['close'] > previous['wma']
+            curr_below_wma = latest['close'] < latest['wma']
+            wma_trending_down = latest['wma_direction'] < 0
+            
+            logger.debug(f"Short signal conditions - Prev above WMA: {prev_above_wma}, Curr below WMA: {curr_below_wma}, WMA trending down: {wma_trending_down}")
+            
+            if prev_below_wma and curr_above_wma and wma_trending_up:
+                logger.info(f"Found potential long setup for {self.symbol}")
+                logger.info(f"Price crossed above WMA-50")
+                logger.info(f"Current price: {latest['close']:.2f} (WMA: {latest['wma']:.2f})")
+                logger.info(f"WMA is trending up")
+                
+                # Create trade setup
+                setup = {
+                    'symbol': self.symbol,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'timeframe': '4h',
+                    'exit_time': datetime.now() + timedelta(hours=self.exit_hours),
+                    'direction': 'long'
+                }
+                
+                return setup
+                
+            elif prev_above_wma and curr_below_wma and wma_trending_down:
+                logger.info(f"Found potential short setup for {self.symbol}")
+                logger.info(f"Price crossed below WMA-50")
+                logger.info(f"Current price: {latest['close']:.2f} (WMA: {latest['wma']:.2f})")
+                logger.info(f"WMA is trending down")
+             
+                # Create trade setup
+                setup = {
+                    'symbol': self.symbol,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'timeframe': '4h',
+                    'exit_time': datetime.now() + timedelta(hours=self.exit_hours),
+                    'direction': 'short'
+                }
+                
+                return setup
+                
+        except Exception as e:
+            logger.error(f"Error in find_trade_setup: {str(e)}")
+        
+        return None
+    
+    def execute_trade(self, setup, quantity):
+        """
+        Execute a trade based on the provided setup
+        """
+        # Place limit order
+        order_result = self.place_market_order(
+                    size=quantity,
+                    side="buy" if setup['direction'] == 'long' else "sell",
+                    trade_side="open",
+                )
+
+        if not order_result:
+            print("Failed to place limit order")
+            return False
+
+        # Get the filled price
+        filled_price = self.get_order_filled_price(order_result)
+        if not filled_price:
+            print("Could not determine filled price, using planned entry price")
+            filled_price = setup['entry_price']
+        filled_price = float(filled_price)
+
+        # Recalculate stop loss and take profit based on actual filled price and direction
+        if setup['direction'] == 'long':
+            stop_loss = filled_price * (1 - float(self.stop_loss_percent)/100)
+            take_profit = filled_price * (1 + float(self.take_profit_percent)/100)
+            sl_side = "sell"
+            tp_side = "buy"
+        else:  # short
+            stop_loss = filled_price * (1 + float(self.stop_loss_percent)/100)
+            take_profit = filled_price * (1 - float(self.take_profit_percent)/100)
+            sl_side = "buy"
+            tp_side = "sell"
+       
+        # Place stop loss order
+        sl_result = self.place_stop_order(quantity, sl_side, "open", stop_loss)
+        if not sl_result:
+            print("Failed to place stop loss order")
+      
+        # Place take profit order
+        tp_result = self.place_take_profit_order(quantity, tp_side, "close", take_profit)
+        if not tp_result:
+            print("Failed to place take profit order")
+       
+        print(f"Trade execution completed for {setup['symbol']}")
+
+        position = {
+            'symbol': self.symbol,
+            'entry_time': datetime.now(),
+            'entry_price': filled_price,
+            'order_id': order_result.get('orderId'),
+            'direction': setup['direction'],
+            'take_profit': take_profit,
+            'stop_loss': stop_loss,
+            'exit_time': setup['exit_time'],
+            'position_size': quantity
+        }
+        
+        self.active_positions.append(position)
+        
+        return True
+    
+    def place_market_order(self, size, side, trade_side):
+        """
+        Place a market order
+        """
+        # First, set the leverage
+        leverage_endpoint = "/api/v2/mix/account/set-leverage"
+        leverage_data = {
+            "symbol": self.symbol,
+            "productType": "USDT-FUTURES",
+            "marginCoin": "USDT",
+            "leverage": str(self.leverage),
+            "holdSide": "long" if side == "buy" else "short" 
+        }
+       
+        leverage_response = self._make_request('POST', leverage_endpoint, data=leverage_data)
+        if not leverage_response or leverage_response.get('code') != '00000':
+            print(f"Failed to set leverage: {leverage_response}")
+            return None
+    
+        # Then place the order
+        endpoint = "/api/v2/mix/order/place-order"
+        data = {
+            "symbol": self.symbol,
+            "productType": "USDT-FUTURES",
+            "marginCoin": "USDT",
+            "size": str(size),
+            "side": side,  # buy or sell
+            "tradeSide": trade_side,  # open or close
+            "orderType": "market",
+            "marginMode": "isolated",
+            "force": "gtc",
+            "clientOid": f"strat_{int(time.time())}"
+        }
+        
+        response = self._make_request('POST', endpoint, data=data)
+        if not response or response.get('code') != '00000':
+            print(f"Failed to place market order: {response}")
+            return None
+        
+        print(f"Market order placed: {response.get('data', {})}")
+        return response.get('data')
+    
+    def place_stop_order(self, size, side, trade_side, stop_price):
+        """
+        Place a stop loss order
+        """
+        endpoint = "/api/v2/mix/order/place-order"
+        data = {
+            "symbol": self.symbol,
+            "productType": "USDT-FUTURES",
+            "marginCoin": "USDT",
+            "size": str(size),
+            "side": "buy" if side == "sell" else "sell",  # Reverse the side for stop loss
+            "tradeSide": trade_side,  # Reverse trade side for shorts
+            "orderType": "market",
+            "marginMode": "isolated",
+            "force": "gtc",
+            "clientOid": f"sl_{int(time.time())}",
+            "presetStopLossPrice": str(self.round_price(float(stop_price)))
+        }
+
+        response = self._make_request('POST', endpoint, data=data)
+        if not response or response.get('code') != '00000':
+            print(f"Failed to place stop loss order: {response}")
+            return None
+        print(f"Stop loss order placed at {stop_price:.2f}")
+        return response.get('data')
+    
+    def place_take_profit_order(self, size, side, trade_side, price):
+        """
+        Place a limit order for take profit
+        """  
+        # Then place the limit order
+        endpoint = "/api/v2/mix/order/place-order"
+        rounded_price = self.round_price(float(price))
+        data = {
+            "symbol": self.symbol,
+            "productType": "USDT-FUTURES",
+            "marginCoin": "USDT",
+            "size": str(size),
+            "side": side,  # buy or sell
+            "tradeSide": trade_side,  # open or close
+            "orderType": "limit",
+            "marginMode": "isolated",
+            "force": "gtc",
+            "clientOid": f"tp_{int(time.time())}",
+            "price": str(rounded_price),
+            "presetTakeProfitPrice": str(rounded_price)
+        }
+
+        response = self._make_request('POST', endpoint, data=data)
+        if not response or response.get('code') != '00000':
+            print(f"Failed to place limit order: {response}")
+            return None
+        
+        print(f"Limit order placed: {response.get('data', {})}")
+        return response.get('data')
+    
+    def place_limit_order(self, size, side, trade_side, price):
+        """
+        Place a limit order
+        """
+        # First, set the leverage
+        leverage_endpoint = "/api/v2/mix/account/set-leverage"
+        leverage_data = {
+            "symbol": self.symbol,
+            "productType": "USDT-FUTURES",
+            "marginCoin": "USDT",
+            "leverage": str(self.leverage),
+            "holdSide": "long" if side == "buy" else "short"
+        }
+        
+        leverage_response = self._make_request('POST', leverage_endpoint, data=leverage_data)
+        if not leverage_response or leverage_response.get('code') != '00000':
+            print(f"Failed to set leverage: {leverage_response}")
+            return None
+            
+        # Then place the limit order
+        endpoint = "/api/v2/mix/order/place-order"
+        rounded_price = self.round_price(float(price))
+        data = {
+            "symbol": self.symbol,
+            "productType": "USDT-FUTURES",
+            "marginCoin": "USDT",
+            "size": str(size),
+            "side": side,  # buy or sell
+            "tradeSide": trade_side,  # open or close
+            "orderType": "limit",
+            "marginMode": "isolated",
+            "force": "gtc",
+            "clientOid": f"strat_{int(time.time())}",
+            "price": str(rounded_price)
+        }
+        
+        response = self._make_request('POST', endpoint, data=data)
+        if not response or response.get('code') != '00000':
+            print(f"Failed to place limit order: {response}")
+            return None
+        
+        print(f"Limit order placed: {response.get('data', {})}")
+        return response.get('data')
+    
+    def get_order_filled_price(self, order_data):
+        """
+        Get the filled price of an order
+        """
+        if not order_data or 'orderId' not in order_data:
+            return None
+        
+        order_id = order_data['orderId']
+        endpoint = "/api/v2/mix/order/fills"
+        params = {
+            'symbol': self.symbol,
+            'productType': 'USDT-FUTURES',
+            'orderId': order_id
+        }
+        
+        response = self._make_request('GET', endpoint, params=params)
+        if not response or response.get('code') != '00000' or not response.get('data'):
+            return None
+        
+        # Extract filled price from order fills
+        fills = response.get('data', {})
+        fill_list = fills.get('fillList', [])
+        if not fill_list:
+            print(f"No fills found for order {order_id}")
+            return None
+     
+        if fill_list:
+            price = float(fill_list[0].get('price', 0))
+            return price
+        else:
+            print(f"Order fills data is not a non-empty list: {fills}")
+            return None
+
+    def run_strategy(self):
+        """
+        Main strategy loop
+        """
+        try:
+            while True:
+                
+                # Get current price and print it
+                params = {
+                    'symbol': self.symbol,
+                    'productType': 'USDT-FUTURES'
+                }
+                ticker_data = self._make_request('GET', "/api/v2/mix/market/ticker", params=params)
+                
+                if ticker_data and ticker_data.get('code') == '00000' and ticker_data.get('data'):
+                    market_data = ticker_data['data'][0]
+                    print(f"\nCurrent Market Data:")
+                    print(f"Last Price: ${float(market_data['lastPr']):.2f}")
+                    print(f"Bid Price: ${float(market_data['bidPr']):.2f}")
+                    print(f"Ask Price: ${float(market_data['askPr']):.2f}")
+                    print(f"24h Change: {float(market_data['change24h']) * 100:.2f}%")
+                    print(f"24h Volume: {float(market_data['baseVolume']):.2f} BTC")
+                else:
+                    print("\nFailed to fetch current market data")
+                
+                # Check for available capital
+                balance = self.get_account_balance()
+                if balance is not None:
+                    print(f"\nAccount Balance: ${balance:.2f}")
+                
+                # Monitor existing positions
+                self.monitor_positions()
+                
+                # Look for new trade setups
+                #setup = self.find_trade_setup()
+                #if setup:
+                
+                setup = {
+                    'symbol': self.symbol,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'timeframe': '4h',
+                    'exit_time': datetime.now() + timedelta(hours=self.exit_hours),
+                    'direction': 'long'
+                }
+                self.execute_trade(setup, self.quantity)
+                
+                print(f"\nWaiting for next check...")
+                time.sleep(self.check_interval)
+                
+        except KeyboardInterrupt:
+            self.emergency_close_all()
+        except Exception as e:
+            self.emergency_close_all()
+            raise
+
+    def round_price(self, price, tick_size=0.1):
+        return round(round(price / tick_size) * tick_size, 1)
+
+def main():
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Run Optimized WMA Trading Strategy')
+    parser.add_argument('--symbol', type=str, default=config.DEFAULT_SYMBOL, 
+                        help=f'Trading pair symbol (default: {config.DEFAULT_SYMBOL})')
+    parser.add_argument('--live', action='store_true', 
+                        help='Run in live trading mode (place real orders)')
+    parser.add_argument('--check-interval', type=int, default=60,
+                        help='Time in seconds between strategy checks (default: 60)')
+    
+    args = parser.parse_args()
+
+    # Initialize the optimized strategy
+    strategy = BitgetTradingStrategy(
+        api_key=config.API_KEY, 
+        api_secret=config.API_SECRET, 
+        passphrase=config.API_PASSPHRASE,
+        symbol=args.symbol,
+        check_interval=args.check_interval
+    )
+    
+    # Run the strategy
+    strategy.run_strategy()
+
+if __name__ == "__main__":
+    main()
