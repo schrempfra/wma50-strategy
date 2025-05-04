@@ -136,9 +136,7 @@ class BitgetTradingStrategy:
                 logger.info(f"Bid: ${market_data['bidPr']} | Ask: ${market_data['askPr']}")
                 logger.info(f"24h Change: {float(market_data['change24h'])*100:.2f}%")
                 logger.info(f"24h Volume: {market_data['baseVolume']} {symbol.replace('USDT', '')}")
-                
-                self.close_position(position, current_price, "Take Profit")
-                sys.exit()
+                                
                 # Update trailing stop if needed
                 updated_stop = self.check_trailing_stop(
                     symbol, 
@@ -224,71 +222,65 @@ class BitgetTradingStrategy:
                 "marginCoin": "USDT"
             })
             
-            # Check if we have any position data before proceeding
-            if (not position_response or 
-                position_response.get('code') != '00000' or 
-                not position_response.get('data') or
-                float(position_response.get('data', [{}])[0].get('total', '0')) <= 0):
-                logger.warning(f"No position found to close for {self.symbol}")
-                # Still remove from active positions to avoid repeated closing attempts
+            # Process position data more carefully to detect empty positions
+            has_active_position = False
+            if (position_response and 
+                position_response.get('code') == '00000' and 
+                position_response.get('data')):
+                
+                position_data = position_response.get('data', [])
+                for pos in position_data:
+                    # Check if we have the same direction and a non-zero size
+                    if (pos.get('holdSide', '').lower() == direction.lower() and 
+                        float(pos.get('total', '0')) > 0):
+                        has_active_position = True
+                        break
+            
+            if not has_active_position:
+                logger.warning(f"No active {direction} position found to close for {self.symbol}")
+                # Remove from active positions to avoid repeated closing attempts
                 self.active_positions = [p for p in self.active_positions if p['order_id'] != position['order_id']]
                 if position['order_id'] in self.trailing_stops:
                     del self.trailing_stops[position['order_id']]
                 return
             
-            # Set appropriate limit price to ensure execution
-            adjustment_factor = 1.00005 if direction == 'long' else 0.99995
-            limit_price = exit_price * adjustment_factor
+            # Initialize success flag
+            order_success = False
             
-            # Cancel pending orders
+            # Cancel pending orders first
+            logger.info(f"Canceling pending orders before closing position")
             self._make_request('POST', "/api/v2/mix/order/cancel-all-orders", data={
                 "symbol": self.symbol,
                 "productType": "USDT-FUTURES",
                 "marginCoin": "USDT"
             })
-
-            # Try limit order first
-            order_success = False
-            order_result = self.place_limit_order(
-                size=position['position_size'],
-                side="sell" if direction == 'long' else "buy",
-                trade_side="close",
-                price=limit_price
-            )
             
-            if order_result:
+            # Give a small delay for cancellations to process
+            time.sleep(0.5)
+            
+            # Try close-positions endpoint first (most reliable)
+            logger.info(f"Trying to close position with close-positions endpoint")
+            close_response = self._make_request('POST', "/api/v2/mix/order/close-positions", data={
+                "symbol": self.symbol,
+                "productType": "USDT-FUTURES",
+                "marginCoin": "USDT",
+                "holdSide": direction
+            })
+            
+            if close_response and close_response.get('code') == '00000':
                 order_success = True
-                logger.info(f"Closed {direction} position with limit order")
-            else:
-                logger.error(f"Failed to close {direction} position with limit order")
-                
-                # Fallback to market order if limit order failed
-                market_result = self.place_market_order(
-                    size=position['position_size'],
-                    side="sell" if direction == 'long' else "buy",
-                    trade_side="close"
-                )
-                
-                if market_result:
-                    order_success = True
-                    logger.info(f"Closed {direction} position with market order")
-                else:
-                    logger.error(f"Failed to close {direction} position with market order")
-
-            # Remove position from active positions
-            self.active_positions = [p for p in self.active_positions if p['order_id'] != position['order_id']]
+                logger.info(f"Successfully closed {direction} position with close-positions endpoint")
             
-            # Remove trailing stop data if exists
-            if position['order_id'] in self.trailing_stops:
-                del self.trailing_stops[position['order_id']]
-                
+            # Remove position from active positions if successfully closed or max retries reached
             if order_success:
                 logger.info(f"Successfully closed {direction} position for {position['symbol']}")
-            else:
-                logger.warning(f"Could not close {direction} position for {position['symbol']} - manual intervention may be needed")
+                self.active_positions = [p for p in self.active_positions if p['order_id'] != position['order_id']]
+                if position['order_id'] in self.trailing_stops:
+                    del self.trailing_stops[position['order_id']]
                 
         except Exception as e:
             logger.error(f"Error closing position: {str(e)}")
+            # Don't remove from active positions on error so it will be retried
 
     def emergency_close_all(self):
         """
@@ -531,7 +523,7 @@ class BitgetTradingStrategy:
                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     'timeframe': '4h',
                     'exit_time': datetime.now() + timedelta(hours=self.exit_hours),
-                    'direction': 'long'
+                    'direction': 'short'
                 }
                 
                 return setup
