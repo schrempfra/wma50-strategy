@@ -814,17 +814,9 @@ class BitgetTradingStrategy:
                 self.monitor_positions()
                 
                 # Look for new trade setups
-                #setup = self.find_trade_setup()
-                #if setup:
-                
-                setup = {
-                    'symbol': self.symbol,
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'timeframe': '4h',
-                    'exit_time': datetime.now() + timedelta(hours=self.exit_hours),
-                    'direction': 'long'
-                }
-                self.execute_trade(setup, self.quantity)
+                setup = self.find_trade_setup()
+                if setup:
+                    self.execute_trade(setup, self.quantity)
                 
                 print(f"\nWaiting for next check...")
                 time.sleep(self.check_interval)
