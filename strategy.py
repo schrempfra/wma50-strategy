@@ -33,8 +33,6 @@ class BitgetTradingStrategy:
         # Strategy parameters
         self.support_resistance_period = 10  # Shorter period for more frequent levels
         self.volume_ma_period = 10          # Shorter period for volume
-        self.atr_period = 14                # ATR period
-        self.atr_multiplier = 1.2           # Tighter ATR multiplier
         self.min_volume_ratio = 0.8         # Lower volume requirement
         self.min_price_change = 0.3         # Lower price change requirement
         self.max_positions = 3
@@ -466,18 +464,8 @@ class BitgetTradingStrategy:
         df['volume_ma'] = df['volume'].rolling(window=self.volume_ma_period).mean()
         df['volume_ratio'] = df['volume'] / df['volume_ma']
         
-        # Calculate ATR
-        df['tr'] = pd.DataFrame({
-            'hl': df['high'] - df['low'],
-            'hc': abs(df['high'] - df['close'].shift(1)),
-            'lc': abs(df['low'] - df['close'].shift(1))
-        }).max(axis=1)
-        df['atr'] = df['tr'].rolling(window=self.atr_period).mean()
-        
         # Calculate Price Action
         df['price_change'] = df['close'].pct_change() * 100
-        df['higher_high'] = df['high'] > df['high'].shift(1)
-        df['lower_low'] = df['low'] < df['low'].shift(1)
         
         # Calculate distance to S/R levels
         df['dist_to_support'] = (df['close'] - df['support']) / df['close'] * 100
@@ -494,7 +482,6 @@ class BitgetTradingStrategy:
         logger.info(f"Latest Support: {df['support'].iloc[-1]:.2f}")
         logger.info(f"Latest Resistance: {df['resistance'].iloc[-1]:.2f}")
         logger.info(f"Latest Volume Ratio: {df['volume_ratio'].iloc[-1]:.2f}")
-        logger.info(f"Latest ATR: {df['atr'].iloc[-1]:.2f}")
         logger.info(f"Latest Price Change: {df['price_change'].iloc[-1]:.2f}%")
         logger.info(f"Latest Momentum: {df['momentum'].iloc[-1]:.2f}%")
         
