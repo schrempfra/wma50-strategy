@@ -30,18 +30,25 @@ class BitgetTradingStrategy:
         self.symbol = symbol
         self.base_url = "https://api.bitget.com"
         
-        # WMA-based Strategy parameters
-        self.ma_period = 50                    # WMA-50
-        self.take_profit_percent = 5.0         # Take profit at 5%
-        self.stop_loss_percent = 1          # Stop loss at 1%
-        self.exit_hours = 36                   # Exit after 36 hours
-        self.use_trailing_stop = True          # Use trailing stop
-        self.trailing_activation_percent = 1.5  # Activate trailing stop at 1.5% profit
-        self.trailing_distance_percent = 1.0    # 1% trailing distance
-        self.position_size_percent = 30.0      # Use 30% of available capital
-        self.leverage = 1                      # Use 1x leverage
+        # Strategy parameters
+        self.support_resistance_period = 10  # Shorter period for more frequent levels
+        self.volume_ma_period = 10          # Shorter period for volume
+        self.atr_period = 14                # ATR period
+        self.atr_multiplier = 1.2           # Tighter ATR multiplier
+        self.min_volume_ratio = 0.8         # Lower volume requirement
+        self.min_price_change = 0.3         # Lower price change requirement
+        self.max_positions = 3
+        self.leverage = 1
+        self.exit_hours = 8                 # Shorter hold time
         self.check_interval = check_interval
         self.quantity = quantity
+        
+        # Risk Management
+        self.take_profit_percent = 3.0         # Take profit at 3%
+        self.stop_loss_percent = 1.5          # Stop loss at 1.5%
+        self.use_trailing_stop = True          # Use trailing stop
+        self.trailing_activation_percent = 1.0  # Activate trailing stop at 1% profit
+        self.trailing_distance_percent = 0.8    # 0.8% trailing distance
         
         # Performance tracking
         self.active_positions = []
@@ -449,99 +456,110 @@ class BitgetTradingStrategy:
     
     def calculate_indicators(self, df):
         """
-        Calculate Weighted Moving Average indicator
+        Calculate technical indicators for the strategy
         """
-        # Calculate Weighted Moving Average with period 50
-        weights = np.arange(1, self.ma_period + 1)
-        df['wma'] = df['close'].rolling(window=self.ma_period).apply(
-            lambda x: np.sum(weights * x) / weights.sum(), raw=True
-        )
+        # Calculate Support and Resistance levels
+        df['support'] = df['low'].rolling(window=self.support_resistance_period).min()
+        df['resistance'] = df['high'].rolling(window=self.support_resistance_period).max()
         
-        # Add WMA direction (1 for up, -1 for down)
-        df['wma_direction'] = np.where(df['wma'].diff() > 0, 1, -1)
+        # Calculate Volume Profile
+        df['volume_ma'] = df['volume'].rolling(window=self.volume_ma_period).mean()
+        df['volume_ratio'] = df['volume'] / df['volume_ma']
         
-        # Add price relative to WMA (in percent)
-        df['price_to_wma'] = (df['close'] - df['wma']) / df['wma'] * 100
+        # Calculate ATR
+        df['tr'] = pd.DataFrame({
+            'hl': df['high'] - df['low'],
+            'hc': abs(df['high'] - df['close'].shift(1)),
+            'lc': abs(df['low'] - df['close'].shift(1))
+        }).max(axis=1)
+        df['atr'] = df['tr'].rolling(window=self.atr_period).mean()
+        
+        # Calculate Price Action
+        df['price_change'] = df['close'].pct_change() * 100
+        df['higher_high'] = df['high'] > df['high'].shift(1)
+        df['lower_low'] = df['low'] < df['low'].shift(1)
+        
+        # Calculate distance to S/R levels
+        df['dist_to_support'] = (df['close'] - df['support']) / df['close'] * 100
+        df['dist_to_resistance'] = (df['resistance'] - df['close']) / df['close'] * 100
+        
+        # Calculate momentum
+        df['momentum'] = df['close'].pct_change(3) * 100  # Shorter momentum period
+        
+        # Calculate trend
+        df['trend'] = df['close'].rolling(window=5).mean() > df['close'].rolling(window=20).mean()
+        
+        # Debug logging
+        logger.info(f"Indicators calculation completed. Sample values:")
+        logger.info(f"Latest Support: {df['support'].iloc[-1]:.2f}")
+        logger.info(f"Latest Resistance: {df['resistance'].iloc[-1]:.2f}")
+        logger.info(f"Latest Volume Ratio: {df['volume_ratio'].iloc[-1]:.2f}")
+        logger.info(f"Latest ATR: {df['atr'].iloc[-1]:.2f}")
+        logger.info(f"Latest Price Change: {df['price_change'].iloc[-1]:.2f}%")
+        logger.info(f"Latest Momentum: {df['momentum'].iloc[-1]:.2f}%")
         
         return df
     
     def find_trade_setup(self):
         """
-        Find potential trade setups based on the WMA crossover strategy with optimized parameters
+        Find trade setups using price action and support/resistance levels
         """
         try:
-            df = self.get_klines(limit=200)
-                
-            if df is None or len(df) < self.ma_period:
-                logger.warning("Not enough data to calculate indicators")
+            df = self.get_klines()
+            if df is None or len(df) < self.support_resistance_period:
                 return None
             
             # Calculate indicators
             df = self.calculate_indicators(df)
             
-            # Get the latest values
-            latest = df.iloc[-1]
+            # Get latest data point
+            current = df.iloc[-1]
             previous = df.iloc[-2]
             
-            logger.debug(f"Latest candle - Close: {latest['close']:.2f}, WMA: {latest['wma']:.2f}, WMA Direction: {latest['wma_direction']}")
-            logger.debug(f"Previous candle - Close: {previous['close']:.2f}, WMA: {previous['wma']:.2f}")
-              
-            # Check for long signal:
-            # 1. Price crosses above WMA (previous close below WMA, current close above WMA)
-            # 2. WMA is trending up
-            prev_below_wma = previous['close'] < previous['wma']
-            curr_above_wma = latest['close'] > latest['wma']
-            wma_trending_up = latest['wma_direction'] > 0
+            # Check if we have too many positions
+            if len(self.active_positions) >= self.max_positions:
+                return None
             
-            logger.debug(f"Long signal conditions - Prev below WMA: {prev_below_wma}, Curr above WMA: {curr_above_wma}, WMA trending up: {wma_trending_up}")
+            # Long setup conditions
+            long_conditions = (
+                (current['dist_to_support'] < 2.0 or current['trend']) and  # Price near support or in uptrend
+                current['price_change'] > self.min_price_change and  # Price moving up
+                current['volume_ratio'] > self.min_volume_ratio and  # Good volume
+                current['momentum'] > -0.5  # Not strongly negative momentum
+            )
             
-            # Check for short signal:
-            # 1. Price crosses below WMA (previous close above WMA, current close below WMA)
-            # 2. WMA is trending down
-            prev_above_wma = previous['close'] > previous['wma']
-            curr_below_wma = latest['close'] < latest['wma']
-            wma_trending_down = latest['wma_direction'] < 0
+            # Short setup conditions
+            short_conditions = (
+                (current['dist_to_resistance'] < 2.0 or not current['trend']) and  # Price near resistance or in downtrend
+                current['price_change'] < -self.min_price_change and  # Price moving down
+                current['volume_ratio'] > self.min_volume_ratio and  # Good volume
+                current['momentum'] < 0.5  # Not strongly positive momentum
+            )
             
-            logger.debug(f"Short signal conditions - Prev above WMA: {prev_above_wma}, Curr below WMA: {curr_below_wma}, WMA trending down: {wma_trending_down}")
-            
-            if prev_below_wma and curr_above_wma and wma_trending_up:
-                logger.info(f"Found potential long setup for {self.symbol}")
-                logger.info(f"Price crossed above WMA-50")
-                logger.info(f"Current price: {latest['close']:.2f} (WMA: {latest['wma']:.2f})")
-                logger.info(f"WMA is trending up")
-                
-                # Create trade setup
-                setup = {
+            if long_conditions:
+                logger.info(f"Long setup found at {current['timestamp']}")
+                return {
+                    'symbol': self.symbol,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'timeframe': '4h',
+                    'exit_time': datetime.now() + timedelta(hours=self.exit_hours),
+                    'direction': 'long'
+                }
+            elif short_conditions:
+                logger.info(f"Short setup found at {current['timestamp']}")
+                return {
                     'symbol': self.symbol,
                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     'timeframe': '4h',
                     'exit_time': datetime.now() + timedelta(hours=self.exit_hours),
                     'direction': 'short'
                 }
-                
-                return setup
-                
-            elif prev_above_wma and curr_below_wma and wma_trending_down:
-                logger.info(f"Found potential short setup for {self.symbol}")
-                logger.info(f"Price crossed below WMA-50")
-                logger.info(f"Current price: {latest['close']:.2f} (WMA: {latest['wma']:.2f})")
-                logger.info(f"WMA is trending down")
-             
-                # Create trade setup
-                setup = {
-                    'symbol': self.symbol,
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    'timeframe': '4h',
-                    'exit_time': datetime.now() + timedelta(hours=self.exit_hours),
-                    'direction': 'short'
-                }
-                
-                return setup
-                
+            
+            return None
+            
         except Exception as e:
-            logger.error(f"Error in find_trade_setup: {str(e)}")
-        
-        return None
+            logger.error(f"Error finding trade setup: {str(e)}")
+            return None
     
     def execute_trade(self, setup, quantity):
         """
