@@ -567,7 +567,7 @@ class BitgetTradingStrategy:
         filled_price = self.get_order_filled_price(order_result)
         if not filled_price:
             print("Could not determine filled price, using planned entry price")
-            filled_price = setup['entry_price']
+            return False
         filled_price = float(filled_price)
 
         # Recalculate stop loss and take profit based on actual filled price and direction
@@ -842,8 +842,6 @@ def main():
     parser = argparse.ArgumentParser(description='Run Optimized WMA Trading Strategy')
     parser.add_argument('--symbol', type=str, default=config.DEFAULT_SYMBOL, 
                         help=f'Trading pair symbol (default: {config.DEFAULT_SYMBOL})')
-    parser.add_argument('--live', action='store_true', 
-                        help='Run in live trading mode (place real orders)')
     parser.add_argument('--check-interval', type=int, default=60,
                         help='Time in seconds between strategy checks (default: 60)')
     
