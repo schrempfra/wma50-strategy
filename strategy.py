@@ -35,7 +35,7 @@ class BitgetTradingStrategy:
         self.volume_ma_period = 10          # Shorter period for volume
         self.min_volume_ratio = 0.8         # Lower volume requirement
         self.min_price_change = 0.3         # Lower price change requirement
-        self.max_positions = 3
+        self.max_positions = 1
         self.leverage = 1
         self.exit_hours = 8                 # Shorter hold time
         self.check_interval = check_interval
@@ -45,7 +45,7 @@ class BitgetTradingStrategy:
         self.take_profit_percent = 3.0         # Take profit at 3%
         self.stop_loss_percent = 1.5          # Stop loss at 1.5%
         self.use_trailing_stop = True          # Use trailing stop
-        self.trailing_activation_percent = 1.0  # Activate trailing stop at 1% profit
+        self.trailing_activation_percent = 0.65  # Activate trailing stop at 1% profit
         self.trailing_distance_percent = 0.8    # 0.8% trailing distance
         
         # Performance tracking
@@ -567,6 +567,7 @@ class BitgetTradingStrategy:
         filled_price = self.get_order_filled_price(order_result)
         if not filled_price:
             print("Could not determine filled price, using planned entry price")
+            self.emergency_close_all()
             return False
         filled_price = float(filled_price)
 
